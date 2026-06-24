@@ -1,10 +1,13 @@
 import os
 import sys
+import shutil
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import pandas as pd
-from unificador import generate_pdf, export_images
+from unificador import generate_pdf, export_images, index_images_from_db
+# pyrefly: ignore [missing-import]
+from PIL import Image, ImageTk
 
 # Intenta habilitar la nitidez de alta resolución (DPI) en Windows
 try:
@@ -17,8 +20,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Unificador de Catálogos a PDF")
-        self.geometry("700x650")
-        self.minsize(650, 600)
+        self.geometry("700x700")
+        self.minsize(650, 650)
         
         # Paleta de colores (Modo Oscuro Elegante)
         self.bg_color = "#121212"       # Fondo general
@@ -64,11 +67,26 @@ class App(tk.Tk):
             foreground=[('disabled', '#555555')]
         )
 
-        # Variables de estado
+        # Estilo del Notebook (pestañas)
+        self.style.configure("TNotebook", background=self.bg_color, borderwidth=0, tabmargins=[0, 5, 0, 0])
+        self.style.configure("TNotebook.Tab", background="#2c2c2c", foreground=self.text_color, font=("Segoe UI", 10, "bold"), padding=[15, 8])
+        self.style.map("TNotebook.Tab",
+            background=[('selected', self.card_color), ('active', '#383838')],
+            foreground=[('selected', self.primary_color), ('active', self.text_color)]
+        )
+
+        # Variables de estado (Pestaña 1 — Catálogo Excel)
         self.excel_path_var = tk.StringVar()
         self.db_path_var = tk.StringVar(value=r"\\feyserver\GRUPOS\Publico\VENTAS\CONTENEDORES 2025\BASE_DE_DATOS_FOTOS_MASTER.db")
         self.pdf_output_var = tk.StringVar()
         self.missing_codes_list = []
+
+        # Variables de estado (Pestaña 2 — Búsqueda Rápida)
+        self.quick_search_var = tk.StringVar()
+        self._quick_found_path = None
+        self._cached_images_dict = None
+        self._cached_db_path = None
+        self._preview_image = None  # Referencia para evitar recolección de basura
         
         self.create_widgets()
         
@@ -77,19 +95,41 @@ class App(tk.Tk):
         main_container = tk.Frame(self, bg=self.bg_color)
         main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
         
-        # 1. Cabecera
+        # 1. Cabecera (siempre visible, fuera del Notebook)
         header_frame = tk.Frame(main_container, bg=self.bg_color)
         header_frame.pack(fill=tk.X, pady=(0, 15))
         
         lbl_title = ttk.Label(header_frame, text="Unificador de Catálogos a PDF", style="Header.TLabel")
         lbl_title.pack(anchor="w")
         
-        lbl_subtitle = ttk.Label(header_frame, text="Busca imágenes recursivamente por sus códigos de Excel y genera un PDF ordenado.", style="Sub.TLabel")
+        lbl_subtitle = ttk.Label(header_frame, text="Busca y exporta imágenes de productos desde la Base de Datos Maestra.", style="Sub.TLabel")
         lbl_subtitle.pack(anchor="w", pady=(2, 0))
         
+        # 2. Notebook con pestañas
+        self.notebook = ttk.Notebook(main_container)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # Pestaña 1: Catálogo desde Excel
+        tab1 = tk.Frame(self.notebook, bg=self.bg_color)
+        self.notebook.add(tab1, text="  📋 Catálogo (Excel)  ")
+        self._create_catalog_tab(tab1)
+        
+        # Pestaña 2: Búsqueda Rápida de un solo código
+        tab2 = tk.Frame(self.notebook, bg=self.bg_color)
+        self.notebook.add(tab2, text="  🔍 Búsqueda Rápida  ")
+        self._create_quick_search_tab(tab2)
+
+    # =========================================================================
+    #  PESTAÑA 1 — Catálogo desde Excel (contenido original, sin cambios)
+    # =========================================================================
+
+    def _create_catalog_tab(self, parent):
+        """Construye todos los widgets de la pestaña de catálogo Excel.
+        Este es el contenido original de create_widgets() movido aquí."""
+
         # 2. Panel de Configuración (Card Blanca)
-        self.card_frame = ttk.Frame(main_container, style="Card.TFrame", padding=15)
-        self.card_frame.pack(fill=tk.X, pady=(0, 15))
+        self.card_frame = ttk.Frame(parent, style="Card.TFrame", padding=15)
+        self.card_frame.pack(fill=tk.X, pady=(10, 15))
         
         # Fila 1: Archivo Excel
         lbl_excel = ttk.Label(self.card_frame, text="Archivo Excel de Códigos:", style="CardLabel.TLabel")
@@ -150,7 +190,7 @@ class App(tk.Tk):
         self.card_frame.columnconfigure(1, weight=1)
         
         # 3. Panel de Progreso y Acción
-        action_frame = tk.Frame(main_container, bg=self.bg_color)
+        action_frame = tk.Frame(parent, bg=self.bg_color)
         action_frame.pack(fill=tk.X, pady=(0, 15))
         
         self.progress = ttk.Progressbar(action_frame, orient="horizontal", mode="determinate")
@@ -173,7 +213,7 @@ class App(tk.Tk):
         self.btn_generate.pack(side=tk.LEFT, ipadx=15, ipady=3)
         
         # 4. Panel de Resultados (Log de Proceso)
-        results_card = ttk.Frame(main_container, style="Card.TFrame", padding=15)
+        results_card = ttk.Frame(parent, style="Card.TFrame", padding=15)
         results_card.pack(fill=tk.BOTH, expand=True)
         
         lbl_results = ttk.Label(results_card, text="Reporte de Ejecución y Códigos Faltantes:", style="CardLabel.TLabel")
@@ -194,7 +234,94 @@ class App(tk.Tk):
         self.btn_copy_missing = ttk.Button(results_card, text="Copiar Códigos Faltantes al Portapapeles", command=self.copy_missing_to_clipboard, state=tk.DISABLED)
         self.btn_copy_missing.pack(anchor="e")
 
-    # --- Acciones de Examinar ---
+    # =========================================================================
+    #  PESTAÑA 2 — Búsqueda Rápida de un solo código
+    # =========================================================================
+
+    def _create_quick_search_tab(self, parent):
+        """Construye los widgets de la pestaña de búsqueda rápida."""
+
+        container = tk.Frame(parent, bg=self.bg_color)
+        container.pack(fill=tk.BOTH, expand=True, padx=15, pady=(10, 15))
+
+        # --- Panel de búsqueda ---
+        search_card = ttk.Frame(container, style="Card.TFrame", padding=15)
+        search_card.pack(fill=tk.X, pady=(0, 15))
+
+        # Fila 1: Campo de código
+        lbl_code = ttk.Label(search_card, text="Código del producto:", style="CardLabel.TLabel")
+        lbl_code.grid(row=0, column=0, sticky="w", pady=(0, 5))
+
+        self.ent_quick_code = ttk.Entry(search_card, textvariable=self.quick_search_var, width=55, font=("Segoe UI", 12))
+        self.ent_quick_code.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 10), pady=(0, 15))
+        self.ent_quick_code.bind("<Return>", lambda e: self.quick_search())
+
+        self.btn_quick_search = ttk.Button(search_card, text="🔍 Buscar", style="Primary.TButton", command=self.quick_search)
+        self.btn_quick_search.grid(row=1, column=2, sticky="ew", pady=(0, 15), ipady=4)
+
+        # Fila 2: Base de Datos (comparte variable con Pestaña 1)
+        lbl_db = ttk.Label(search_card, text="Base de Datos Maestro (.db / .csv):", style="CardLabel.TLabel")
+        lbl_db.grid(row=2, column=0, sticky="w", pady=(0, 5))
+
+        self.ent_quick_db = ttk.Entry(search_card, textvariable=self.db_path_var, width=55)
+        self.ent_quick_db.grid(row=3, column=0, columnspan=2, sticky="ew", padx=(0, 10), pady=(0, 5))
+
+        self.btn_quick_db = ttk.Button(search_card, text="Seleccionar Base de Datos", command=self.browse_database_file)
+        self.btn_quick_db.grid(row=3, column=2, sticky="ew", pady=(0, 5))
+
+        search_card.columnconfigure(0, weight=1)
+        search_card.columnconfigure(1, weight=1)
+
+        # --- Panel de resultado ---
+        result_card = ttk.Frame(container, style="Card.TFrame", padding=15)
+        result_card.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+
+        lbl_result_title = ttk.Label(result_card, text="Resultado:", style="CardLabel.TLabel")
+        lbl_result_title.pack(anchor="w", pady=(0, 10))
+
+        # Contenido: previsualización (izquierda) + info (derecha)
+        result_content = tk.Frame(result_card, bg=self.card_color)
+        result_content.pack(fill=tk.BOTH, expand=True)
+
+        # Panel de previsualización (cuadro oscuro fijo)
+        self.preview_frame = tk.Frame(result_content, bg="#2c2c2c", width=200, height=200,
+                                      highlightbackground=self.border_color, highlightthickness=1)
+        self.preview_frame.pack(side=tk.LEFT, padx=(0, 15), pady=5)
+        self.preview_frame.pack_propagate(False)
+
+        self.preview_label = tk.Label(self.preview_frame, bg="#2c2c2c", text="Sin imagen",
+                                      fg=self.text_muted, font=("Segoe UI", 9))
+        self.preview_label.pack(expand=True)
+
+        # Panel de información (derecha)
+        info_frame = tk.Frame(result_content, bg=self.card_color)
+        info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=5)
+
+        self.lbl_quick_status = ttk.Label(info_frame, text="Ingresa un código y presiona Buscar.",
+                                          style="CardSubLabel.TLabel")
+        self.lbl_quick_status.pack(anchor="w", pady=(0, 8))
+
+        self.lbl_quick_path = ttk.Label(info_frame, text="", style="CardSubLabel.TLabel", wraplength=350)
+        self.lbl_quick_path.pack(anchor="w", pady=(0, 5))
+
+        # --- Botones de acción ---
+        buttons_frame = tk.Frame(container, bg=self.bg_color)
+        buttons_frame.pack(fill=tk.X)
+
+        self.btn_quick_clear = ttk.Button(buttons_frame, text="🧹 Limpiar", command=self.quick_clear)
+        self.btn_quick_clear.pack(side=tk.LEFT, ipadx=10, ipady=3, padx=(0, 8))
+
+        self.btn_quick_export = ttk.Button(buttons_frame, text="📁 Exportar Copia",
+                                           command=self.quick_export_image, state=tk.DISABLED)
+        self.btn_quick_export.pack(side=tk.RIGHT, ipadx=10, ipady=3, padx=(8, 0))
+
+        self.btn_quick_open = ttk.Button(buttons_frame, text="📂 Abrir Imagen",
+                                         command=self.quick_open_image, state=tk.DISABLED)
+        self.btn_quick_open.pack(side=tk.RIGHT, ipadx=10, ipady=3)
+
+    # =========================================================================
+    #  ACCIONES DE EXAMINAR (compartidas entre pestañas)
+    # =========================================================================
     
     def browse_excel(self):
         path = filedialog.askopenfilename(
@@ -226,7 +353,9 @@ class App(tk.Tk):
         if path:
             self.pdf_output_var.set(path)
 
-    # --- Cargar datos del Excel dinámicamente ---
+    # =========================================================================
+    #  CARGAR DATOS DEL EXCEL (Pestaña 1)
+    # =========================================================================
     
     def on_excel_selected(self):
         path = self.excel_path_var.get()
@@ -288,7 +417,9 @@ class App(tk.Tk):
             self.column_combo.set(selected_col)
         self.set_status("Listo para comenzar.")
 
-    # --- Limpiar Interfaz ---
+    # =========================================================================
+    #  LIMPIAR INTERFAZ (Pestaña 1)
+    # =========================================================================
     
     def clear_all(self):
         """Limpia todos los campos de la interfaz y reinicia el estado."""
@@ -306,7 +437,9 @@ class App(tk.Tk):
         self.set_status("Listo para comenzar.")
         self.log_text.delete("1.0", tk.END)
 
-    # --- Generación del PDF ---
+    # =========================================================================
+    #  GENERACIÓN DEL PDF (Pestaña 1)
+    # =========================================================================
     
     def set_status(self, text):
         self.lbl_status.config(text=text)
@@ -425,7 +558,9 @@ class App(tk.Tk):
         self.clipboard_append(text)
         messagebox.showinfo("Portapapeles", "La lista de códigos faltantes se copió al portapapeles.")
 
-    # --- Exportación de Imágenes Individuales ---
+    # =========================================================================
+    #  EXPORTACIÓN DE IMÁGENES INDIVIDUALES (Pestaña 1)
+    # =========================================================================
     
     def start_export(self):
         """Valida los campos comunes y pide una carpeta destino para exportar las imágenes."""
@@ -513,6 +648,139 @@ class App(tk.Tk):
         self.log_text.insert(tk.END, f"\n[ERROR] La exportación falló: {error_msg}\n")
         self.log_text.see(tk.END)
         messagebox.showerror("Error de Exportación", f"No se pudieron exportar las imágenes:\n{error_msg}")
+
+    # =========================================================================
+    #  BÚSQUEDA RÁPIDA (Pestaña 2)
+    # =========================================================================
+
+    def _get_images_dict(self):
+        """Retorna el diccionario de imágenes cacheado. Solo recarga si la ruta de la DB cambió."""
+        db_path = self.db_path_var.get()
+        if self._cached_images_dict is None or self._cached_db_path != db_path:
+            self._cached_images_dict = index_images_from_db(db_path)
+            self._cached_db_path = db_path
+        return self._cached_images_dict
+
+    def quick_search(self):
+        """Busca un solo código en la Base de Datos Maestra y muestra el resultado."""
+        code = self.quick_search_var.get().strip()
+        if not code:
+            messagebox.showwarning("Campo vacío", "Por favor, escribe un código para buscar.")
+            return
+
+        db_path = self.db_path_var.get()
+        if not db_path or not os.path.isfile(db_path):
+            messagebox.showerror("Base de Datos", "La ruta de la Base de Datos no es válida. Selecciona un archivo .db o .csv.")
+            return
+
+        # Feedback visual inmediato
+        self.lbl_quick_status.config(text="Buscando...", foreground=self.text_muted)
+        self.lbl_quick_path.config(text="")
+        self._quick_found_path = None
+        self.btn_quick_open.config(state=tk.DISABLED)
+        self.btn_quick_export.config(state=tk.DISABLED)
+        self._clear_preview()
+        self.btn_quick_search.config(state=tk.DISABLED)
+
+        def search():
+            try:
+                images_dict = self._get_images_dict()
+                code_lower = code.lower().strip()
+
+                if code_lower in images_dict:
+                    found_path = images_dict[code_lower]
+                    self.after(0, lambda: self._show_quick_result(code, found_path))
+                else:
+                    self.after(0, lambda: self._show_quick_not_found(code))
+            except Exception as e:
+                error_msg = str(e)
+                self.after(0, lambda: self._show_quick_error(error_msg))
+            finally:
+                self.after(0, lambda: self.btn_quick_search.config(state=tk.NORMAL))
+
+        threading.Thread(target=search, daemon=True).start()
+
+    def _show_quick_result(self, code, path):
+        """Muestra el resultado exitoso de una búsqueda rápida."""
+        self._quick_found_path = path
+        self.lbl_quick_status.config(text=f"✅ Código '{code}' encontrado:", foreground="#4caf50")
+        self.lbl_quick_path.config(text=path)
+        self.btn_quick_open.config(state=tk.NORMAL)
+        self.btn_quick_export.config(state=tk.NORMAL)
+        self._show_preview(path)
+
+    def _show_quick_not_found(self, code):
+        """Muestra el resultado cuando un código no se encuentra."""
+        self._quick_found_path = None
+        self.lbl_quick_status.config(text=f"❌ Código '{code}' no encontrado en la Base de Datos.", foreground="#f44336")
+        self.lbl_quick_path.config(text="")
+        self.btn_quick_open.config(state=tk.DISABLED)
+        self.btn_quick_export.config(state=tk.DISABLED)
+        self._clear_preview()
+
+    def _show_quick_error(self, error_msg):
+        """Muestra un error ocurrido durante la búsqueda."""
+        self.lbl_quick_status.config(text=f"⚠ Error: {error_msg}", foreground="#ff9800")
+        self.lbl_quick_path.config(text="")
+        # Invalidar caché en caso de error (la DB puede haber cambiado)
+        self._cached_images_dict = None
+        self._cached_db_path = None
+
+    def _show_preview(self, path):
+        """Carga una miniatura de la imagen en el panel de previsualización."""
+        try:
+            img = Image.open(path)
+            img.thumbnail((190, 190), Image.LANCZOS)
+            self._preview_image = ImageTk.PhotoImage(img)
+            self.preview_label.config(image=self._preview_image, text="")
+            img.close()
+        except Exception:
+            self._clear_preview()
+            self.preview_label.config(text="No se pudo\ncargar vista previa")
+
+    def _clear_preview(self):
+        """Limpia la previsualización de imagen."""
+        self._preview_image = None
+        self.preview_label.config(image="", text="Sin imagen")
+
+    def quick_open_image(self):
+        """Abre la imagen encontrada con el programa predeterminado del sistema."""
+        if self._quick_found_path and os.path.isfile(self._quick_found_path):
+            os.startfile(self._quick_found_path)
+        else:
+            messagebox.showerror("Error", "La imagen no existe o no se puede acceder. Realiza una nueva búsqueda.")
+
+    def quick_export_image(self):
+        """Copia la imagen encontrada a una carpeta elegida por el usuario."""
+        if not self._quick_found_path or not os.path.isfile(self._quick_found_path):
+            messagebox.showerror("Error", "No hay imagen para exportar. Realiza una búsqueda primero.")
+            return
+
+        dest_folder = filedialog.askdirectory(title="Seleccionar carpeta de destino")
+        if not dest_folder:
+            return
+
+        try:
+            code = self.quick_search_var.get().strip()
+            ext = os.path.splitext(self._quick_found_path)[1]
+            dest_path = os.path.join(dest_folder, f"{code}{ext}")
+            shutil.copy2(self._quick_found_path, dest_path)
+            messagebox.showinfo("Éxito", f"Imagen exportada correctamente a:\n{dest_path}")
+        except Exception as e:
+            messagebox.showerror("Error de Exportación", f"No se pudo exportar la imagen:\n{str(e)}")
+
+    def quick_clear(self):
+        """Limpia todos los campos de la pestaña de búsqueda rápida e invalida la caché."""
+        self.quick_search_var.set("")
+        self._quick_found_path = None
+        self.btn_quick_open.config(state=tk.DISABLED)
+        self.btn_quick_export.config(state=tk.DISABLED)
+        self.lbl_quick_status.config(text="Ingresa un código y presiona Buscar.", foreground=self.text_muted)
+        self.lbl_quick_path.config(text="")
+        self._clear_preview()
+        # Invalidar caché para forzar recarga si la DB cambió
+        self._cached_images_dict = None
+        self._cached_db_path = None
 
 if __name__ == "__main__":
     app = App()
