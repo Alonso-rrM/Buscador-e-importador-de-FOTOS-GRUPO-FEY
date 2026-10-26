@@ -1,6 +1,6 @@
 import csv
 
-path = r"\\feyserver\GRUPOS\Publico\VENTAS\CONTENEDORES 2025\BASE_DE_DATOS_FOTOS_MASTER.db"
+path = r"\\feyserver\GRUPOS\ANALISIS COMERCIAL\VENTAS\CONTENEDORES 2025\BASE_DE_DATOS_FOTOS_MASTER.db"
 
 def count_columns(file_path):
     counts = {}
