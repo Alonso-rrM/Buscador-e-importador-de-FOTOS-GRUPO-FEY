@@ -21,8 +21,10 @@ def create_corrupt_image(path):
     with open(path, 'wb') as f:
         f.write(b'\x00\x01\x02CORRUPTO\xff\xfe')
 
-def setup_test_environment():
-    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_env")
+def setup_test_environment(base_dir=None):
+    """Crea imágenes, Base de Datos Maestra y Excel de prueba. Devuelve la carpeta usada."""
+    if base_dir is None:
+        base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_env")
     images_dir = os.path.join(base_dir, "imagenes")
     os.makedirs(images_dir, exist_ok=True)
     
@@ -126,10 +128,9 @@ def setup_test_environment():
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name="Lista Principal", index=False)
         pd.DataFrame({"Otros": [1, 2, 3]}).to_excel(writer, sheet_name="Hoja Secundaria", index=False)
-        
-    print(f"Entorno de pruebas configurado exitosamente en: {base_dir}")
-    print(f"- Archivo Excel: {excel_path}")
-    print(f"- Base de Datos (CSV): {db_path}")
+
+    return base_dir
 
 if __name__ == "__main__":
-    setup_test_environment()
+    base_dir = setup_test_environment()
+    print(f"Entorno de pruebas configurado exitosamente en: {base_dir}")

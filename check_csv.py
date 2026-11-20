@@ -19,7 +19,11 @@ def count_columns(file_path):
         print(f"  {count} lineas tienen exactamente {cols} columnas.")
     print(f"Total de lineas leidas: {total_lines}")
 
-try:
-    count_columns(path)
-except Exception as e:
-    print("Error:", e)
+if __name__ == "__main__":
+    import sys
+    # Uso: python check_csv.py [ruta_de_la_bd]  (por defecto, la ruta de red)
+    target = sys.argv[1] if len(sys.argv) > 1 else path
+    try:
+        count_columns(target)
+    except (OSError, csv.Error, UnicodeDecodeError) as e:
+        print("Error:", e)

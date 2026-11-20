@@ -1,68 +1,91 @@
+"""
+Lógica de negocio del Unificador de Catálogos.
+
+No conoce la interfaz gráfica: recibe rutas y un callback de progreso
+opcional `progress_callback(actual, total, mensaje)`, y devuelve resultados
+o lanza excepciones con mensajes listos para mostrar al usuario.
+"""
 import os
 import re
 import shutil
+
 import pandas as pd
 # pyrefly: ignore [missing-import]
 from PIL import Image
 
-SUPPORTED_EXTENSIONS = ('.jpg', '.jpeg', '.png')
+# --- Reglas de negocio -------------------------------------------------------
+CATALOG_PREFIX = "xz"                       # Solo las fotos finales del catálogo
+SUPPORTED_EXTENSIONS = (".jpg", ".jpeg", ".png")
+DB_REQUIRED_COLUMNS = ("Nombre_Archivo", "Ruta_Completa", "Fecha_Modificacion")
 
-def index_images_from_db(db_path):
-    """
-    Lee la base de datos maestra (.db / .csv) y devuelve un Diccionario (Hash Table).
-    
-    REGLA DE NEGOCIO: 
-    1. Solo se indexan imágenes cuyo nombre empiece con el prefijo "xz" (foto final).
-    2. Si hay múltiples versiones (duplicados de código), se conserva 
-       la que tenga la 'Fecha_Modificacion' más reciente.
-    
-    Llave: Código real del producto (nombre sin el prefijo "xz", en minúsculas).
-    Valor: Ruta completa de la imagen.
-    Complejidad de búsqueda: O(1) por código.
-    """
-    if not os.path.isfile(db_path):
-        raise ValueError(f"El archivo de base de datos no existe: {db_path}")
-
-    # Leer el archivo CSV con separador punto y coma
-    df = pd.read_csv(db_path, sep=';', dtype=str, encoding='utf-8-sig', na_filter=False)
-    
-    required_cols = {'Nombre_Archivo', 'Ruta_Completa', 'Fecha_Modificacion'}
-    if not required_cols.issubset(set(df.columns)):
-        raise ValueError("La base de datos no contiene las columnas necesarias (Nombre_Archivo, Ruta_Completa, Fecha_Modificacion).")
-    
-    # 1. Convertir nombres a minúsculas
-    df['Nombre_Lower'] = df['Nombre_Archivo'].str.lower()
-    
-    # 2. Filtrar solo los que empiezan por 'xz'
-    df_xz = df[df['Nombre_Lower'].str.startswith('xz')]
-    if df_xz.empty:
-        return {}
-    
-    # 3. Extraer extensión y filtrar las soportadas
-    df_xz = df_xz.copy()
-    df_xz['Ext_Lower'] = df_xz['Nombre_Lower'].apply(lambda x: os.path.splitext(x)[1])
-    df_valid = df_xz[df_xz['Ext_Lower'].isin(SUPPORTED_EXTENSIONS)].copy()
-    if df_valid.empty:
-        return {}
-        
-    # 4. Extraer el código limpio (quitar "xz" y la extensión)
-    # Ejemplo: "xzgf-5657.jpg" -> "gf-5657"
-    df_valid['Clean_Code'] = df_valid['Nombre_Lower'].apply(lambda x: os.path.splitext(x)[0][2:])
-    
-    # 5. Ordenar por Fecha_Modificacion (descendente)
-    # pd.to_datetime convierte correctamente fechas como "2026-02-06 10:08:04"
-    df_valid['Fecha_Date'] = pd.to_datetime(df_valid['Fecha_Modificacion'], errors='coerce')
-    df_sorted = df_valid.sort_values(by='Fecha_Date', ascending=False)
-    
-    # 6. Eliminar duplicados quedándonos con el primero (el más reciente)
-    df_final = df_sorted.drop_duplicates(subset=['Clean_Code'], keep='first')
-    
-    # 7. Construir y retornar el diccionario Hash
-    images_dict = dict(zip(df_final['Clean_Code'], df_final['Ruta_Completa']))
-    
-    return images_dict
-
+# "xzGF-5657.jpg" -> code="gf-5657", ext="jpg" (sobre el nombre en minúsculas)
+_CATALOG_NAME_PATTERN = rf"^{re.escape(CATALOG_PREFIX)}(?P<code>.+)\.(?P<ext>[^.]+)$"
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+# Errores esperables al abrir una imagen: corrupta, inaccesible o demasiado grande
+_IMAGE_ERRORS = (OSError, ValueError, Image.DecompressionBombError)
+
+
+def _ignore_progress(current, total, message):
+    """Callback por defecto: no reporta nada."""
+
+
+# =============================================================================
+#  Funciones puras (sin E/S): fáciles de probar de forma aislada
+# =============================================================================
+
+def normalize_code(code):
+    """Forma canónica de un código para comparar: sin espacios y en minúsculas."""
+    return code.strip().lower()
+
+
+def clean_codes(values):
+    """Quita espacios y descarta valores vacíos o 'nan', conservando el orden."""
+    stripped = (str(value).strip() for value in values)
+    return [code for code in stripped if code and code.lower() != "nan"]
+
+
+def build_image_index(df):
+    """
+    Construye el índice {código: ruta} a partir de las filas de la base maestra.
+
+    REGLAS DE NEGOCIO:
+    1. Solo se indexan imágenes cuyo nombre empieza con el prefijo "xz" y
+       tienen una extensión soportada.
+    2. Si un código aparece varias veces, gana la 'Fecha_Modificacion' más
+       reciente. Las fechas inválidas pierden siempre y, ante un empate, gana
+       la primera fila del archivo (ordenamiento estable).
+
+    Llave: código del producto en minúsculas, sin prefijo ni extensión.
+    Búsqueda posterior: O(1) por código (tabla hash).
+    """
+    parts = df["Nombre_Archivo"].str.lower().str.extract(_CATALOG_NAME_PATTERN)
+    candidates = df.assign(
+        code=parts["code"],
+        ext="." + parts["ext"],
+        fecha=pd.to_datetime(df["Fecha_Modificacion"], errors="coerce"),
+    )
+    valid = candidates[candidates["code"].notna() & candidates["ext"].isin(SUPPORTED_EXTENSIONS)]
+    latest = (valid
+              .sort_values("fecha", ascending=False, kind="stable", na_position="last")
+              .drop_duplicates(subset="code", keep="first"))
+    return dict(zip(latest["code"], latest["Ruta_Completa"]))
+
+
+def match_codes(codes, images_dict):
+    """
+    Busca cada código en el índice respetando el orden de entrada.
+    Devuelve ([(código, ruta), ...] encontrados, [códigos faltantes]).
+    """
+    matches, missing = [], []
+    for code in codes:
+        path = images_dict.get(normalize_code(code))
+        if path is None:
+            missing.append(code)
+        else:
+            matches.append((code, path))
+    return matches, missing
+
 
 def sanitize_filename(name):
     """
@@ -70,229 +93,165 @@ def sanitize_filename(name):
     reemplaza separadores de ruta y caracteres inválidos en Windows por '_',
     y elimina puntos/espacios finales. Evita escribir fuera de la carpeta destino.
     """
-    clean = _INVALID_FILENAME_CHARS.sub('_', name).strip(' .')
-    return clean or '_'
+    clean = _INVALID_FILENAME_CHARS.sub("_", name).strip(" .")
+    return clean or "_"
+
 
 def convert_to_rgb(img):
     """
     Convierte una imagen de cualquier formato a RGB.
-    Si tiene transparencia (PNG/WebP), la coloca sobre un fondo blanco en lugar de negro.
+    Si tiene transparencia, la coloca sobre un fondo blanco en lugar de negro.
     """
-    if img.mode == 'RGB':
+    if img.mode == "RGB":
         return img
-    # Si tiene transparencia o canal alfa, la procesamos con fondo blanco
-    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-        rgba_img = img.convert('RGBA')
-        background = Image.new('RGB', rgba_img.size, (255, 255, 255))
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba_img = img.convert("RGBA")
+        background = Image.new("RGB", rgba_img.size, (255, 255, 255))
         background.paste(rgba_img, mask=rgba_img.split()[-1])
         return background
-    else:
-        return img.convert('RGB')
+    return img.convert("RGB")
+
+
+# =============================================================================
+#  Lectura de archivos (Excel y Base de Datos Maestra)
+# =============================================================================
+
+def list_sheets(excel_path):
+    """Nombres de las hojas de un Excel."""
+    with pd.ExcelFile(excel_path) as workbook:
+        return list(workbook.sheet_names)
+
+
+def list_columns(excel_path, sheet_name):
+    """Encabezados de una hoja (solo lee la primera fila)."""
+    return list(pd.read_excel(excel_path, sheet_name=sheet_name, nrows=0).columns)
+
+
+def read_codes(excel_path, sheet_name, column_name):
+    """Lee y limpia los códigos de una columna del Excel."""
+    try:
+        # dtype=str evita que los enteros se lean como flotantes (ej. 1234.0)
+        df = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
+    except Exception as e:  # pandas lanza tipos muy variados según el problema
+        raise ValueError(f"Error al leer el archivo Excel: {e}") from e
+
+    if column_name not in df.columns:
+        raise ValueError(f"La columna '{column_name}' no existe en la hoja seleccionada del Excel.")
+
+    codes = clean_codes(df[column_name].dropna())
+    if not codes:
+        raise ValueError("No se encontraron códigos válidos en la columna seleccionada.")
+    return codes
+
+
+def index_images_from_db(db_path):
+    """Lee la base de datos maestra (.db / .csv separado por ';') y la indexa."""
+    if not os.path.isfile(db_path):
+        raise ValueError(f"El archivo de base de datos no existe: {db_path}")
+
+    df = pd.read_csv(db_path, sep=";", dtype=str, encoding="utf-8-sig", na_filter=False)
+    if not set(DB_REQUIRED_COLUMNS).issubset(df.columns):
+        raise ValueError("La base de datos no contiene las columnas necesarias "
+                         f"({', '.join(DB_REQUIRED_COLUMNS)}).")
+    return build_image_index(df)
+
+
+def _find_matches(excel_path, sheet_name, column_name, db_path, report):
+    """Paso común a PDF y exportación: Excel -> índice de la BD -> coincidencias."""
+    codes = read_codes(excel_path, sheet_name, column_name)
+    report(0, len(codes), "Leyendo Base de Datos Maestra...")
+    matches, missing = match_codes(codes, index_images_from_db(db_path))
+    if not matches:
+        raise ValueError("No se encontró ninguna imagen que coincida exactamente con los códigos de la lista.")
+    return matches, missing
+
+
+# =============================================================================
+#  Casos de uso
+# =============================================================================
+
+def _iter_rgb_images(matches, report, opened, skipped):
+    """
+    Genera las imágenes en RGB una a una (ahorra memoria), omitiendo las ilegibles.
+    Registra en `opened` todo lo abierto (Pillow lo necesita abierto hasta terminar
+    de guardar el PDF) y en `skipped` los códigos omitidos.
+    """
+    total = len(matches)
+    for idx, (code, path) in enumerate(matches, start=1):
+        try:
+            img = Image.open(path)
+            opened.append(img)
+            rgb_img = convert_to_rgb(img)
+        except _IMAGE_ERRORS as e:
+            skipped.append(code)
+            report(idx, total, f"Omitiendo por error al abrir {os.path.basename(path)}: {e}")
+            continue
+        if rgb_img is not img:
+            opened.append(rgb_img)
+        report(idx, total, f"Agregando página ({idx}/{total}): {code}")
+        yield rgb_img
+
 
 def generate_pdf(excel_path, sheet_name, column_name, db_path, output_pdf_path, progress_callback=None):
     """
-    Lee los códigos de Excel, busca imágenes coincidentes en la Base de Datos Maestra,
-    y las une en un único archivo PDF en el orden del Excel.
+    Une en un PDF las imágenes de los códigos del Excel, en el mismo orden.
+    Devuelve (páginas escritas, códigos sin imagen en la BD).
     """
-    # 1. Leer Excel
-    try:
-        # Se usa dtype=str para evitar que enteros se lean como flotantes (ej. 1234.0)
-        df = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
-    except Exception as e:
-        raise ValueError(f"Error al leer el archivo Excel: {str(e)}")
-        
-    if column_name not in df.columns:
-        raise ValueError(f"La columna '{column_name}' no existe en la hoja seleccionada del Excel.")
-    
-    # Extraer códigos, limpiar espacios y omitir vacíos (incluyendo 'nan' literal)
-    raw_codes = df[column_name].dropna().astype(str).tolist()
-    codes = [c.strip() for c in raw_codes if c.strip() and c.strip().lower() != 'nan']
-    
-    if not codes:
-        raise ValueError("No se encontraron códigos válidos en la columna seleccionada.")
-    
-    # 2. Leer Base de Datos Maestra e indexar imágenes (Hash Table O(1))
-    if progress_callback:
-        progress_callback(0, len(codes), "Leyendo Base de Datos Maestra...")
-    
-    # --- IMPLEMENTACIÓN DE HASH TABLE DESDE DB ---
-    # Se crea el diccionario con las rutas de las imágenes pre-procesadas
-    images_dict = index_images_from_db(db_path)
-    
-    # 3. Buscar coincidencias manteniendo el orden del Excel
-    pdf_images_paths = []
-    missing_codes = []
-    
-    total_codes = len(codes)
-    for idx, code in enumerate(codes):
-        if progress_callback:
-            progress_callback(idx, total_codes, f"Buscando código ({idx+1}/{total_codes}): {code}")
-            
-        # Limpieza del código del Excel
-        code_lower = code.lower().strip()
-        
-        # --- COINCIDENCIA ESTRICTA (Strict Matching O(1)) ---
-        # Búsqueda directa en el diccionario, evitando falsos positivos de .endswith()
-        if code_lower in images_dict:
-            pdf_images_paths.append(images_dict[code_lower])
-        else:
-            missing_codes.append(code)
-            
-    if not pdf_images_paths:
-        raise ValueError("No se encontró ninguna imagen que coincida exactamente con los códigos de la lista.")
-        
-    if progress_callback:
-        progress_callback(total_codes - 1, total_codes, "Generando archivo PDF...")
-        
-    # 4. Cargar imágenes y unirlas en el PDF (uso de generador para ahorrar memoria)
-    # NOTA: Pillow necesita que las imágenes permanezcan abiertas hasta que .save()
-    # termine de escribir el PDF completo. Por eso las acumulamos y cerramos al final.
-    opened_images = []
-    pages_written = 1  # La primera imagen válida ya inicializa el PDF
+    report = progress_callback or _ignore_progress
+    matches, missing = _find_matches(excel_path, sheet_name, column_name, db_path, report)
 
-    def image_generator(paths_iterator):
-        nonlocal pages_written
-        for img_path in paths_iterator:
-            try:
-                img = Image.open(img_path)
-                rgb_img = convert_to_rgb(img)
-                # Registrar para cerrar después del guardado
-                opened_images.append(img)
-                if rgb_img is not img:
-                    opened_images.append(rgb_img)
-                pages_written += 1
-                yield rgb_img
-            except Exception as e:
-                # --- MANEJO DE ERRORES: Mostrar el error real ---
-                if progress_callback:
-                    progress_callback(total_codes - 1, total_codes, f"Omitiendo por error al abrir {os.path.basename(img_path)}: {str(e)}")
-                continue
-                
-    # Convertimos la lista en un iterador para consumir la primera imagen válida y pasar el resto al generador
-    paths_iter = iter(pdf_images_paths)
-    first_img = None
-    first_orig = None
-    
-    # Buscamos la primera imagen que no esté corrupta para inicializar el PDF
-    for path in paths_iter:
-        try:
-            first_orig = Image.open(path)
-            first_img = convert_to_rgb(first_orig)
-            break
-        except Exception as e:
-            if progress_callback:
-                progress_callback(total_codes - 1, total_codes, f"Omitiendo imagen inicial por error al abrir {os.path.basename(path)}: {str(e)}")
-            continue
-            
-    if not first_img:
-        raise RuntimeError("Todas las imágenes encontradas están corruptas y no se pudo generar el PDF.")
-            
+    opened, skipped = [], []
     try:
-        # Guardado del PDF consumiendo el generador
-        first_img.save(
-            output_pdf_path,
-            save_all=True,
-            append_images=image_generator(paths_iter)
-        )
-    except PermissionError:
-        # --- MANEJO DE ERRORES: Archivos Bloqueados ---
-        # Captura específica si el usuario tiene el PDF abierto en otro programa
-        raise RuntimeError("El archivo PDF de destino está abierto o bloqueado por otro programa. Por favor, ciérrelo e intente nuevamente.")
-    except Exception as e:
-        raise RuntimeError(f"Error al escribir el archivo PDF: {str(e)}")
+        pages = _iter_rgb_images(matches, report, opened, skipped)
+        first_page = next(pages, None)
+        if first_page is None:
+            raise RuntimeError("Todas las imágenes encontradas están corruptas y no se pudo generar el PDF.")
+        try:
+            first_page.save(output_pdf_path, save_all=True, append_images=pages)
+        except PermissionError as e:
+            raise RuntimeError("El archivo PDF de destino está abierto o bloqueado por otro programa. "
+                               "Por favor, ciérrelo e intente nuevamente.") from e
+        except Exception as e:  # Pillow puede fallar de muchas formas al escribir
+            raise RuntimeError(f"Error al escribir el archivo PDF: {e}") from e
     finally:
-        # Cerrar TODAS las imágenes después de que el PDF se haya escrito
-        if first_orig:
-            first_orig.close()
-        if first_img and first_img is not first_orig:
-            first_img.close()
-        for img in opened_images:
-            try:
-                img.close()
-            except Exception:
-                pass
-            
-    if progress_callback:
-        progress_callback(total_codes, total_codes, "¡PDF generado con éxito!")
-        
-    # Páginas realmente escritas (excluye imágenes omitidas por estar corruptas)
-    return pages_written, missing_codes
+        for img in opened:
+            img.close()
+
+    report(len(matches), len(matches), "¡PDF generado con éxito!")
+    return len(matches) - len(skipped), missing
 
 
 def export_images(excel_path, sheet_name, column_name, db_path, output_folder, progress_callback=None):
     """
-    Lee los códigos de Excel, busca imágenes coincidentes en la Base de Datos Maestra,
-    y copia cada imagen individual a la carpeta de destino.
-    
-    Cada archivo se nombra con el código del Excel para fácil identificación.
-    Si ya existe un archivo con el mismo nombre, se sobreescribe.
+    Copia a `output_folder` la imagen de cada código del Excel, nombrada con el
+    código (saneado). Los códigos repetidos se copian una sola vez.
+    Devuelve (imágenes copiadas, códigos sin imagen en la BD).
     """
-    # 1. Leer Excel (misma lógica que generate_pdf)
-    try:
-        df = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
-    except Exception as e:
-        raise ValueError(f"Error al leer el archivo Excel: {str(e)}")
-        
-    if column_name not in df.columns:
-        raise ValueError(f"La columna '{column_name}' no existe en la hoja seleccionada del Excel.")
-    
-    raw_codes = df[column_name].dropna().astype(str).tolist()
-    codes = [c.strip() for c in raw_codes if c.strip() and c.strip().lower() != 'nan']
-    
-    if not codes:
-        raise ValueError("No se encontraron códigos válidos en la columna seleccionada.")
-    
-    # 2. Leer Base de Datos Maestra e indexar imágenes
-    if progress_callback:
-        progress_callback(0, len(codes), "Leyendo Base de Datos Maestra...")
-    
-    images_dict = index_images_from_db(db_path)
-    
-    # 3. Crear la carpeta de destino si no existe
+    report = progress_callback or _ignore_progress
+    matches, missing = _find_matches(excel_path, sheet_name, column_name, db_path, report)
     os.makedirs(output_folder, exist_ok=True)
-    
-    # 4. Buscar coincidencias y copiar cada imagen individual
-    exported_count = 0
-    missing_codes = []
-    seen_codes = set()
 
-    total_codes = len(codes)
-    for idx, code in enumerate(codes):
-        if progress_callback:
-            progress_callback(idx, total_codes, f"Exportando imagen ({idx+1}/{total_codes}): {code}")
-
-        code_lower = code.lower().strip()
-
-        # Código repetido en el Excel: ya se exportó, no se vuelve a copiar
-        # (evita sobrescribir el mismo archivo y contarlo dos veces).
-        if code_lower in seen_codes:
-            if progress_callback:
-                progress_callback(idx, total_codes, f"Código duplicado omitido: {code}")
+    exported, seen = 0, set()
+    total = len(matches)
+    for idx, (code, src_path) in enumerate(matches, start=1):
+        key = normalize_code(code)
+        if key in seen:
+            report(idx, total, f"Código duplicado omitido: {code}")
             continue
+        seen.add(key)
 
-        if code_lower in images_dict:
-            seen_codes.add(code_lower)
-            src_path = images_dict[code_lower]
-            # Mantener la extensión original del archivo fuente
-            ext = os.path.splitext(src_path)[1]
-            # Nombrar el archivo con el código del Excel, saneado para que no
-            # pueda contener separadores de ruta ni caracteres inválidos.
-            dest_filename = f"{sanitize_filename(code)}{ext}"
-            dest_path = os.path.join(output_folder, dest_filename)
+        ext = os.path.splitext(src_path)[1]
+        dest_path = os.path.join(output_folder, f"{sanitize_filename(code)}{ext}")
+        try:
+            shutil.copy2(src_path, dest_path)
+        except OSError as e:
+            report(idx, total, f"Error al copiar {code}: {e}")
+            continue
+        exported += 1
+        report(idx, total, f"Exportando imagen ({idx}/{total}): {code}")
 
-            try:
-                shutil.copy2(src_path, dest_path)
-                exported_count += 1
-            except Exception as e:
-                if progress_callback:
-                    progress_callback(idx, total_codes, f"Error al copiar {code}: {str(e)}")
-        else:
-            missing_codes.append(code)
-    
-    if exported_count == 0:
-        raise ValueError("No se encontró ninguna imagen que coincida con los códigos de la lista.")
-    
-    if progress_callback:
-        progress_callback(total_codes, total_codes, f"¡Exportación completada! {exported_count} imágenes copiadas.")
-        
-    return exported_count, missing_codes
+    if exported == 0:
+        raise ValueError("No se pudo copiar ninguna de las imágenes encontradas.")
+
+    report(total, total, f"¡Exportación completada! {exported} imágenes copiadas.")
+    return exported, missing
