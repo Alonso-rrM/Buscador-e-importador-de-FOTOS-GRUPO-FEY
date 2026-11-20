@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import pandas as pd
 # pyrefly: ignore [missing-import]
@@ -60,6 +61,17 @@ def index_images_from_db(db_path):
     images_dict = dict(zip(df_final['Clean_Code'], df_final['Ruta_Completa']))
     
     return images_dict
+
+_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+def sanitize_filename(name):
+    """
+    Convierte un texto (ej. un código del Excel) en un nombre de archivo seguro:
+    reemplaza separadores de ruta y caracteres inválidos en Windows por '_',
+    y elimina puntos/espacios finales. Evita escribir fuera de la carpeta destino.
+    """
+    clean = _INVALID_FILENAME_CHARS.sub('_', name).strip(' .')
+    return clean or '_'
 
 def convert_to_rgb(img):
     """
@@ -136,8 +148,10 @@ def generate_pdf(excel_path, sheet_name, column_name, db_path, output_pdf_path, 
     # NOTA: Pillow necesita que las imágenes permanezcan abiertas hasta que .save()
     # termine de escribir el PDF completo. Por eso las acumulamos y cerramos al final.
     opened_images = []
-    
+    pages_written = 1  # La primera imagen válida ya inicializa el PDF
+
     def image_generator(paths_iterator):
+        nonlocal pages_written
         for img_path in paths_iterator:
             try:
                 img = Image.open(img_path)
@@ -146,6 +160,7 @@ def generate_pdf(excel_path, sheet_name, column_name, db_path, output_pdf_path, 
                 opened_images.append(img)
                 if rgb_img is not img:
                     opened_images.append(rgb_img)
+                pages_written += 1
                 yield rgb_img
             except Exception as e:
                 # --- MANEJO DE ERRORES: Mostrar el error real ---
@@ -200,7 +215,8 @@ def generate_pdf(excel_path, sheet_name, column_name, db_path, output_pdf_path, 
     if progress_callback:
         progress_callback(total_codes, total_codes, "¡PDF generado con éxito!")
         
-    return len(pdf_images_paths), missing_codes
+    # Páginas realmente escritas (excluye imágenes omitidas por estar corruptas)
+    return pages_written, missing_codes
 
 
 def export_images(excel_path, sheet_name, column_name, db_path, output_folder, progress_callback=None):
@@ -238,22 +254,32 @@ def export_images(excel_path, sheet_name, column_name, db_path, output_folder, p
     # 4. Buscar coincidencias y copiar cada imagen individual
     exported_count = 0
     missing_codes = []
-    
+    seen_codes = set()
+
     total_codes = len(codes)
     for idx, code in enumerate(codes):
         if progress_callback:
             progress_callback(idx, total_codes, f"Exportando imagen ({idx+1}/{total_codes}): {code}")
-            
+
         code_lower = code.lower().strip()
-        
+
+        # Código repetido en el Excel: ya se exportó, no se vuelve a copiar
+        # (evita sobrescribir el mismo archivo y contarlo dos veces).
+        if code_lower in seen_codes:
+            if progress_callback:
+                progress_callback(idx, total_codes, f"Código duplicado omitido: {code}")
+            continue
+
         if code_lower in images_dict:
+            seen_codes.add(code_lower)
             src_path = images_dict[code_lower]
             # Mantener la extensión original del archivo fuente
             ext = os.path.splitext(src_path)[1]
-            # Nombrar el archivo con el código del Excel (legible)
-            dest_filename = f"{code}{ext}"
+            # Nombrar el archivo con el código del Excel, saneado para que no
+            # pueda contener separadores de ruta ni caracteres inválidos.
+            dest_filename = f"{sanitize_filename(code)}{ext}"
             dest_path = os.path.join(output_folder, dest_filename)
-            
+
             try:
                 shutil.copy2(src_path, dest_path)
                 exported_count += 1

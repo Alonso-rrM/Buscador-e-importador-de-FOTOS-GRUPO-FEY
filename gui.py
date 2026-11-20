@@ -5,7 +5,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import pandas as pd
-from unificador import generate_pdf, export_images, index_images_from_db
+from unificador import generate_pdf, export_images, index_images_from_db, sanitize_filename
 # pyrefly: ignore [missing-import]
 from PIL import Image, ImageTk
 
@@ -763,7 +763,7 @@ class App(tk.Tk):
         try:
             code = self.quick_search_var.get().strip()
             ext = os.path.splitext(self._quick_found_path)[1]
-            dest_path = os.path.join(dest_folder, f"{code}{ext}")
+            dest_path = os.path.join(dest_folder, f"{sanitize_filename(code)}{ext}")
             shutil.copy2(self._quick_found_path, dest_path)
             messagebox.showinfo("Éxito", f"Imagen exportada correctamente a:\n{dest_path}")
         except Exception as e:

@@ -1,5 +1,9 @@
 import os
+import re
 import sys
+import shutil
+import tempfile
+import pandas as pd
 # pyrefly: ignore [missing-import]
 from PIL import Image
 
@@ -8,7 +12,7 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
 from generate_test_data import setup_test_environment
-from unificador import generate_pdf, index_images_from_db
+from unificador import generate_pdf, export_images, index_images_from_db, sanitize_filename
 
 # ============================================================
 #  SUITE DE TESTS - UNIFICADOR DE CATÁLOGOS
@@ -105,7 +109,8 @@ def test_generate_pdf():
         generation_ok = False
     
     check(generation_ok, "generate_pdf() se ejecutó sin excepciones fatales")
-    check(matched_count == 4, f"Coincidencias en paths: {matched_count} (esperado: 4)")
+    # 4 coincidencias en la BD, pero xzGF-4444 está corrupta: solo 3 páginas reales
+    check(matched_count == 3, f"Páginas escritas en el PDF: {matched_count} (esperado: 3, la corrupta no cuenta)")
     
     expected_missing = ["GF-9999", "GF-3333"]
     check(missing == expected_missing, f"Códigos faltantes: {missing} (esperado: {expected_missing})")
@@ -115,8 +120,11 @@ def test_generate_pdf():
     
     if os.path.exists(output_pdf):
         with open(output_pdf, 'rb') as f:
-            header = f.read(5)
+            content = f.read()
+        header = content[:5]
         check(header == b'%PDF-', f"Encabezado PDF válido: {header}")
+        real_pages = len(re.findall(rb"/Type\s*/Page\b(?!s)", content))
+        check(real_pages == matched_count, f"Conteo reportado ({matched_count}) = páginas reales del PDF ({real_pages})")
         
         file_size = os.path.getsize(output_pdf)
         check(file_size > 1000, f"Tamaño del PDF: {file_size:,} bytes (> 1KB)")
@@ -188,6 +196,52 @@ def test_corrupt_image_handling():
     else:
         check(False, "PDF no se generó - posible crash por imagen corrupta")
 
+# ----------------------------------------------------------
+# TEST 5: Exportación de imágenes individuales
+# ----------------------------------------------------------
+def test_export_images():
+    print("\n" + "=" * 60)
+    print("  TEST 5: Exportación de imágenes (nombres seguros y duplicados)")
+    print("=" * 60)
+
+    base_dir = get_base_dir()
+    db_path = os.path.join(base_dir, "BASE_DE_DATOS_FOTOS_MASTER.db")
+    tmp = tempfile.mkdtemp()
+    try:
+        # Flujo normal
+        out = os.path.join(tmp, "normal")
+        count, missing = export_images(os.path.join(base_dir, "lista_codigos.xlsx"),
+                                       "Lista Principal", "Código Producto", db_path, out)
+        check(count == len(os.listdir(out)), f"Conteo exportado ({count}) = archivos en carpeta ({len(os.listdir(out))})")
+        check(missing == ["GF-9999", "GF-3333"], f"Códigos faltantes en export: {missing}")
+
+        # Códigos duplicados (misma clave con distinto formato)
+        excel_dup = os.path.join(tmp, "dup.xlsx")
+        pd.DataFrame({"c": ["GF-1111", "gf-1111", " GF-1111 "]}).to_excel(excel_dup, index=False)
+        out = os.path.join(tmp, "dup")
+        count, _ = export_images(excel_dup, 0, "c", db_path, out)
+        check(count == 1 and len(os.listdir(out)) == 1, f"Duplicados: 1 archivo y conteo 1 (conteo={count})")
+
+        # Código con separadores de ruta: no debe escapar de la carpeta destino
+        evil = "../escape"
+        rows = pd.read_csv(db_path, sep=";", dtype=str, encoding="utf-8-sig")
+        rows.loc[len(rows)] = ["'xz" + evil, rows.Ruta_Completa[0], "xz" + evil + ".jpg",
+                               ".jpg", "2026-01-01 00:00:00", "x"]
+        db_evil = os.path.join(tmp, "evil.db")
+        rows.to_csv(db_evil, sep=";", index=False, encoding="utf-8-sig")
+        excel_evil = os.path.join(tmp, "evil.xlsx")
+        pd.DataFrame({"c": [evil]}).to_excel(excel_evil, index=False)
+        out = os.path.join(tmp, "dest", "sub")
+        export_images(excel_evil, 0, "c", db_evil, out)
+        check(not os.path.exists(os.path.join(tmp, "dest", "escape.jpg")),
+              "Código '../escape' NO escribe fuera de la carpeta destino")
+        check(len(os.listdir(out)) == 1, f"Archivo saneado creado dentro del destino: {os.listdir(out)}")
+
+        check(sanitize_filename('a<b>c:d"e/f\\g|h?i*j') == "a_b_c_d_e_f_g_h_i_j", "sanitize_filename reemplaza caracteres inválidos")
+        check(sanitize_filename("...") == "_", "sanitize_filename nunca devuelve nombre vacío")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 # ============================================================
 #  EJECUCIÓN PRINCIPAL
 # ============================================================
@@ -205,7 +259,8 @@ def main():
     test_generate_pdf()
     test_error_handling()
     test_corrupt_image_handling()
-    
+    test_export_images()
+
     total = PASS + FAIL
     print("\n" + "═" * 60)
     print(f"  RESUMEN FINAL: {PASS}/{total} tests pasaron")
